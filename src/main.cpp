@@ -1,19 +1,23 @@
 #include <Arduino.h>
-#include <SoftwareSerial.h>
 #include <mcp_can.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ElegantOTA.h>
 #include "config.h"
 
-ESP8266WebServer server(80);
-SoftwareSerial btSerial(D3, D4);
+ESP8266WebServer webServer(80);
+WiFiServer socketServer(35000);
+WiFiClient client;
 
 #define CAN_CS_PIN D8
 #define CAN_INT_PIN D2
 #define WIFI_SCAN_INTERVAL 30000U
 
+IPAddress local(192, 168, 0, 10);
+IPAddress subnet(255, 255, 255, 0); 
+
 uint32_t nextScanMillis = 0;
+uint32_t nextMsgMillis = 0;
 MCP_CAN can(CAN_CS_PIN);
 
 long unsigned int frameId;
@@ -26,23 +30,27 @@ long unsigned int filter = 0;
 
 void setup() {
   Serial.begin(9600);
-  btSerial.begin(115200);
 
   WiFi.persistent(false);
   WiFi.setAutoReconnect(false);
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
 
-  if(can.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK)
+  WiFi.softAPConfig(local, local, subnet);
+  WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS, 1, 1);
+
+  if(can.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
     Serial.println("MCP2515 Initialized Successfully!");
-  else
+  } else {
     Serial.println("Error Initializing MCP2515...");
+  }
 
   can.setMode(MCP_NORMAL);
   pinMode(CAN_INT_PIN, INPUT);
 
-  ElegantOTA.begin(&server);
-  server.begin();
+  ElegantOTA.begin(&webServer);
+  webServer.begin();
+  socketServer.begin();
 }
 
 int hexToInt(String str)
@@ -50,77 +58,57 @@ int hexToInt(String str)
   return (int) strtol(str.c_str(), 0, 16);
 }
 
-void setFilter(uint32_t filter) {
-  can.init_Filt(0, 0, filter);
-}
-
-void setMask(uint32_t mask) {
-  can.init_Mask(0, 0, mask);
-  can.init_Mask(1, 0, mask);
-}
-
 void loop() {
-  /*
-  if (Serial.available()) {
-    btSerial.write(Serial.read());
-  }
-  */
-  
   uint32_t now = millis();
   
+  // Reconnect if device doesn't have IP
   if (WiFi.isConnected() && !WiFi.localIP().isSet())
   {
-    // Reconnect if device doesn't have IP
     WiFi.disconnect();
   }
 
   if (now >= nextScanMillis && !WiFi.isConnected())
   {
-    WiFi.scanNetworks(true, true, 0U, (uint8_t*) WIFI_SSID);
+    WiFi.scanNetworks(true, true, 0U, (uint8_t*) WIFI_HOME_SSID);
     nextScanMillis = now + WIFI_SCAN_INTERVAL;
   }
 
   int8_t totalNetworks = WiFi.scanComplete();
   if (totalNetworks > 0)
   {
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("Connecting to ");
+    Serial.println(WIFI_HOME_SSID);
+    WiFi.begin(WIFI_HOME_SSID, WIFI_HOME_PASS);
     WiFi.scanDelete();
   }
 
-  if (btSerial.available()) {
-    String data = btSerial.readStringUntil('\r');
-    //btSerial.println(data);
+  if (!client.connected()) {
+    client.stop();
+    client = socketServer.accept();
+  }
 
-    //Serial.print("RX: ");
-    //Serial.println(data);
+  if (client.connected() && client.available() > 0) {
+    String data = client.readStringUntil('\r');
 
     if (monitoring) {
       monitoring = false;
-      btSerial.print("STOPPED\r>");
+      client.print("STOPPED\r>");
 
     } else if (data.startsWith("ATCM")) {
       String hex = data.substring(data.length() - 3);
       mask = hexToInt(hex);
-      //setMask(hexToInt(hex) << 16);
-
-      btSerial.print("OK\r>");
+      client.print("OK\r>");
 
     } else if (data.startsWith("ATCF")) {
       String hex = data.substring(data.length() - 3);
       filter = hexToInt(hex);
-      //setFilter(hexToInt(hex) << 16);
-
-      //Serial.print("FILTER: "); Serial.println(hex);
-      btSerial.print("OK\r>");
+      client.print("OK\r>");
 
     } else if (data.startsWith("ATCRA")) {
       String hex = data.substring(data.length() - 3);
       filter = hexToInt(hex);
       mask = 0x7FF;
-      //setFilter(hexToInt(hex) << 16);
-      //setMask(0x07FF0000);
-
-      btSerial.print("OK\r>");
+      client.print("OK\r>");
 
     } else if (data.startsWith("ATMA")) {
       monitoring = true;
@@ -128,33 +116,52 @@ void loop() {
     } else if (data.startsWith("TEST")) {
       byte txData[] = {0x03, 0x22, 0x12, 0x30};
       if (can.sendMsgBuf(0x792, 4, txData) == CAN_OK) {
-        btSerial.print("SENT\r");
+        client.print("SENT\r");
         monitoring = true;
         mask = 0x7FF;
         filter = 0x793;
       } else {
-        btSerial.print("ERROR\r>");
+        client.print("ERROR\r>");
       }
-      
-      //btSerial.print("OK\r>");
-      
+
     } else {
-      btSerial.print("?\r>");
+      client.print("?\r>");
     }
   }
 
+  /*
   if (!digitalRead(CAN_INT_PIN)) {
     can.readMsgBuf(&frameId, &frameLength, frameData);
 
-    if (monitoring && (frameId & mask) == filter) {
-    //if (monitoring) {
-      btSerial.printf("%.3lX", frameId);
+    if (monitoring && client.connected() && (frameId & mask) == filter) {
+      client.flush();
+      
+      client.printf("%.3lX", frameId);
       for (byte i = 0; i < frameLength; i++) {
-        btSerial.printf("%.2X", frameData[i]);
+        client.printf("%.2X", frameData[i]);
       }
-      btSerial.print('\r');
+      client.print('\r');
     }
   }
+  */
 
-  server.handleClient();
+  if (now >= nextMsgMillis)
+  {
+    if (monitoring && client.connected()) {
+      //client.flush();
+      client.print("60D");
+      client.print("00");
+      client.print("FF");
+      client.print("00");
+      client.print("FF");
+      client.print("00");
+      client.print("FF");
+      client.print("00");
+      client.print("FF");
+      client.print("\r");
+    }
+    nextMsgMillis = now + 10;
+  }
+
+  webServer.handleClient();
 }
